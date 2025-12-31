@@ -1,0 +1,5 @@
+chromadb
+python-dotenv
+openai
+PyMuPDF
+requests
