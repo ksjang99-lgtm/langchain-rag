@@ -10,7 +10,7 @@ from dotenv import load_dotenv
 # 1. 설정 및 프롬프트 관리 (관리 용이성)
 # ==========================================
 MODEL_NAME = "gpt-4o-mini"
-DATASET_PATH = "./Data/"
+DATASET_PATH = "../Data/"
 OUTPUT_FILE = "integrated_knowledge_base.json"
 IMAGE_DIR = "extracted_images"
 
