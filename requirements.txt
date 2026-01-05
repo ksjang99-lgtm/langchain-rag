@@ -2,4 +2,6 @@ chromadb
 python-dotenv
 openai
 PyMuPDF
+streamlit
+
 requests
