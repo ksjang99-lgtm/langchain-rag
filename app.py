@@ -1,491 +1,15 @@
-import os
-import json
-import time
-import re
-from dataclasses import dataclass
-from typing import List, Optional, Dict, Any, Tuple
-
+import hashlib
 import streamlit as st
-import fitz  # PyMuPDF
 
-from openai import OpenAI
-from supabase import create_client, Client
-from dotenv import load_dotenv
+from config import load_settings
+from clients import get_openai_client
+from ocr_service import extract_text_from_image_gpt41mini
+from ingest_service import ingest_pdf_to_supabase
+from retrieval_service import retrieve_contexts, list_docs, get_page_image_url
+from answer_service import openai_answer_with_rag
+from storage_service import delete_doc_and_assets
+from utils_text import is_refusal_answer, merge_pages_cited_then_search
 
-
-# =========================
-# Config
-# =========================
-
-@dataclass
-class Settings:
-    openai_api_key: str
-    supabase_url: str
-    supabase_service_key: str
-    storage_bucket: str = "manual-pages"
-
-    # Retrieval
-    top_k: int = 10
-
-    # UI slider default = 0.00 (keep previous behavior)
-    similarity_threshold: float = 0.00
-
-    # Related pages
-    max_related_pages: int = 5
-
-    # Chunking
-    chunk_size: int = 900
-    chunk_overlap: int = 150
-
-    # Models
-    chat_model: str = "gpt-4.1-mini"
-    embedding_model: str = "text-embedding-3-small"
-
-    # text-embedding-3-small default dims
-    embedding_dims: int = 1536
-
-
-def _ensure_trailing_slash(url: str) -> str:
-    url = (url or "").strip()
-    if not url:
-        return url
-    return url if url.endswith("/") else (url + "/")
-
-load_dotenv()
-def load_settings() -> Settings:
-    return Settings(
-        openai_api_key=os.getenv("OPENAI_API_KEY"),
-        supabase_url=os.getenv("SUPABASE_URL"),
-        supabase_service_key=os.getenv("SUPABASE_SERVICE_ROLE_KEY"),
-    )
-
-# =========================
-# Clients
-# =========================
-
-@st.cache_resource
-def get_openai_client(api_key: str) -> OpenAI:
-    return OpenAI(api_key=api_key)
-
-
-@st.cache_resource
-def get_supabase_client(url: str, key: str) -> Client:
-    return create_client(url, key)
-
-
-# =========================
-# Utilities
-# =========================
-
-def chunk_text(text: str, chunk_size: int, overlap: int) -> List[str]:
-    text = (text or "").strip()
-    if not text:
-        return []
-    chunks = []
-    start = 0
-    n = len(text)
-    while start < n:
-        end = min(start + chunk_size, n)
-        chunk = text[start:end].strip()
-        if chunk:
-            chunks.append(chunk)
-        if end == n:
-            break
-        start = max(0, end - overlap)
-    return chunks
-
-
-def robust_json_loads(s: str) -> Optional[Dict[str, Any]]:
-    try:
-        return json.loads(s)
-    except Exception:
-        return None
-
-
-def openai_embed(client: OpenAI, model: str, text: str) -> List[float]:
-    resp = client.embeddings.create(model=model, input=text)
-    return resp.data[0].embedding
-
-
-def embedding_to_pgvector_str(emb: List[float]) -> str:
-    return "[" + ",".join(f"{x:.8f}" for x in emb) + "]"
-
-
-def is_refusal_answer(answer: str) -> bool:
-    if not answer:
-        return True
-    return "문서에 존재하지 않습니다" in answer.strip()
-
-
-def merge_pages_cited_then_search(
-    cited_pages: List[int],
-    contexts: List[Dict[str, Any]],
-    max_pages: int
-) -> List[int]:
-    """
-    1) cited_pages 우선
-    2) 부족하면 검색 결과 contexts에서 유니크 페이지로 보충
-    3) 최종 페이지 오름차순
-    """
-    picked: List[int] = []
-    seen = set()
-
-    for p in cited_pages or []:
-        try:
-            p = int(p)
-        except Exception:
-            continue
-        if p in seen:
-            continue
-        seen.add(p)
-        picked.append(p)
-        if len(picked) >= max_pages:
-            return sorted(picked)
-
-    for c in contexts or []:
-        p = int(c["page_number"])
-        if p in seen:
-            continue
-        seen.add(p)
-        picked.append(p)
-        if len(picked) >= max_pages:
-            break
-
-    return sorted(picked)
-
-
-def is_toc_page(text: str) -> bool:
-    """
-    목차 페이지 휴리스틱 판정 (한국어/영문 대응)
-    - '목차' 또는 'contents/table of contents' 포함 + 목차 특유 패턴(도트 리더/짧은 라인 반복/페이지번호 나열) 중 일부
-    """
-    t = (text or "").strip()
-    if not t:
-        return False
-
-    low = t.lower()
-
-    keyword = ("목차" in t) or ("table of contents" in low) or (re.search(r"\bcontents\b", low) is not None)
-    if not keyword:
-        return False
-
-    dot_leader_count = len(re.findall(r"\.{3,}", t))
-
-    lines = [ln.strip() for ln in t.splitlines() if ln.strip()]
-    numeric_tail_lines = 0
-    for ln in lines[:80]:
-        if re.search(r"\d+\s*$", ln) and (len(ln) < 120):
-            numeric_tail_lines += 1
-
-    short_lines = sum(1 for ln in lines[:80] if len(ln) <= 60)
-
-    score = 0
-    if dot_leader_count >= 3:
-        score += 1
-    if numeric_tail_lines >= 6:
-        score += 1
-    if short_lines >= 25:
-        score += 1
-
-    return score >= 1
-
-
-def openai_answer_with_rag(
-    client: OpenAI,
-    model: str,
-    question: str,
-    contexts: List[Dict[str, Any]],
-) -> Dict[str, Any]:
-    """
-    contexts: [{"page_number": int, "content": str, "similarity": float}, ...]
-    return: {"answer": str, "cited_pages": [int, ...]}
-    """
-    ctx_lines = []
-    for c in contexts:
-        ctx_lines.append(f"[page={c['page_number']}, similarity={c['similarity']:.3f}]\n{c['content']}")
-    ctx_text = "\n\n---\n\n".join(ctx_lines)
-
-    system = (
-        "너는 장비 매뉴얼 PDF를 기반으로만 답하는 고객지원 챗봇이다.\n"
-        "규칙:\n"
-        "1) 아래 제공된 '매뉴얼 발췌'에 없는 정보는 절대 추측하지 말고, 반드시 '문서에 존재하지 않습니다.' 라고 답하라.\n"
-        "2) 답변은 한국어로, 간결하되 사용자가 바로 실행할 수 있게 단계형으로 작성하라.\n"
-        "3) 답변에 근거가 된 페이지 번호를 cited_pages 배열로 반드시 포함하라.\n"
-        "4) 출력은 JSON 하나로만: {\"answer\": string, \"cited_pages\": number[]}\n"
-    )
-
-    user = f"질문:\n{question}\n\n매뉴얼 발췌:\n{ctx_text}\n"
-
-    try:
-        resp = client.responses.create(
-            model=model,
-            input=[
-                {"role": "system", "content": system},
-                {"role": "user", "content": user},
-            ],
-        )
-        text_out = resp.output_text
-    except Exception:
-        resp = client.chat.completions.create(
-            model=model,
-            messages=[
-                {"role": "system", "content": system},
-                {"role": "user", "content": user},
-            ],
-            temperature=0.2,
-        )
-        text_out = resp.choices[0].message.content or ""
-
-    data = robust_json_loads((text_out or "").strip())
-    if not data or "answer" not in data:
-        return {"answer": "문서에 존재하지 않습니다.", "cited_pages": []}
-
-    raw_pages = data.get("cited_pages", [])
-    cited_pages: List[int] = []
-    for p in raw_pages:
-        try:
-            cited_pages.append(int(p))
-        except Exception:
-            pass
-    cited_pages = sorted(set(cited_pages))
-
-    return {"answer": str(data.get("answer", "")).strip(), "cited_pages": cited_pages}
-
-
-# =========================
-# Storage helpers
-# =========================
-
-def ensure_bucket_exists(sb: Client, bucket: str, public: bool = True) -> None:
-    try:
-        buckets = sb.storage.list_buckets()
-        exists = any(b.get("name") == bucket for b in buckets)
-        if not exists:
-            sb.storage.create_bucket(bucket, public=public)
-        return
-    except Exception:
-        pass
-
-    try:
-        sb.storage.create_bucket(bucket, public=public)
-    except Exception:
-        return
-
-
-def supabase_upload_png(sb: Client, bucket: str, path: str, png_bytes: bytes) -> str:
-    ensure_bucket_exists(sb, bucket, public=True)
-    try:
-        sb.storage.from_(bucket).upload(
-            path=path,
-            file=png_bytes,
-            file_options={"content-type": "image/png", "upsert": "true"},
-        )
-    except Exception:
-        ensure_bucket_exists(sb, bucket, public=True)
-        sb.storage.from_(bucket).upload(
-            path=path,
-            file=png_bytes,
-            file_options={"content-type": "image/png", "upsert": "true"},
-        )
-    return sb.storage.from_(bucket).get_public_url(path)
-
-
-def _chunks(lst: List[str], n: int) -> List[List[str]]:
-    return [lst[i:i + n] for i in range(0, len(lst), n)]
-
-
-def delete_doc_and_assets(settings: Settings, doc_id: int) -> Dict[str, Any]:
-    """
-    doc_id의:
-    - Storage(이미지) 삭제
-    - DB(rag_chunks, manual_pages, manual_docs) 삭제
-    """
-    sb = get_supabase_client(settings.supabase_url, settings.supabase_service_key)
-
-    # 1) 이미지 path 수집
-    pages_res = (
-        sb.table("manual_pages")
-        .select("image_path")
-        .eq("doc_id", doc_id)
-        .execute()
-    )
-    image_paths = [r["image_path"] for r in (pages_res.data or []) if r.get("image_path")]
-
-    # 2) Storage 삭제 (배치)
-    storage_deleted = 0
-    storage_failed: List[str] = []
-    if image_paths:
-        for batch in _chunks(image_paths, 100):
-            try:
-                sb.storage.from_(settings.storage_bucket).remove(batch)
-                storage_deleted += len(batch)
-            except Exception:
-                storage_failed.extend(batch)
-
-    # 3) DB 삭제 (순서 중요: child -> parent)
-    # rag_chunks
-    try:
-        sb.table("rag_chunks").delete().eq("doc_id", doc_id).execute()
-    except Exception as e:
-        return {"ok": False, "error": f"rag_chunks delete failed: {e}", "storage_deleted": storage_deleted, "storage_failed": storage_failed}
-
-    # manual_pages
-    try:
-        sb.table("manual_pages").delete().eq("doc_id", doc_id).execute()
-    except Exception as e:
-        return {"ok": False, "error": f"manual_pages delete failed: {e}", "storage_deleted": storage_deleted, "storage_failed": storage_failed}
-
-    # manual_docs
-    try:
-        sb.table("manual_docs").delete().eq("id", doc_id).execute()
-    except Exception as e:
-        return {"ok": False, "error": f"manual_docs delete failed: {e}", "storage_deleted": storage_deleted, "storage_failed": storage_failed}
-
-    return {"ok": True, "storage_deleted": storage_deleted, "storage_failed": storage_failed}
-
-
-# =========================
-# Ingest
-# =========================
-
-def ingest_pdf_to_supabase(settings: Settings, pdf_bytes: bytes, title: str) -> Tuple[int, int]:
-    oai = get_openai_client(settings.openai_api_key)
-    sb = get_supabase_client(settings.supabase_url, settings.supabase_service_key)
-
-    doc_row = sb.table("manual_docs").insert({"title": title, "file_name": f"{title}.pdf"}).execute()
-    doc_id = int(doc_row.data[0]["id"])
-
-    doc = fitz.open(stream=pdf_bytes, filetype="pdf")
-    total_chunks = 0
-
-    for page_index in range(doc.page_count):
-        page_number = page_index + 1
-        page = doc.load_page(page_index)
-
-        text = page.get_text("text") or ""
-        toc_flag = is_toc_page(text)
-
-        pix = page.get_pixmap(dpi=160)
-        png = pix.tobytes("png")
-
-        img_path = f"{doc_id}/page_{page_number:04d}.png"
-        img_url = supabase_upload_png(sb, settings.storage_bucket, img_path, png)
-
-        sb.table("manual_pages").upsert(
-            {
-                "doc_id": doc_id,
-                "page_number": page_number,
-                "image_path": img_path,
-                "image_url": img_url,
-                "is_toc": toc_flag,
-            },
-            on_conflict="doc_id,page_number",
-        ).execute()
-
-        chunks = chunk_text(text, settings.chunk_size, settings.chunk_overlap)
-        if not chunks:
-            continue
-
-        rows = []
-        for ci, chunk in enumerate(chunks):
-            emb = openai_embed(oai, settings.embedding_model, chunk)
-            if len(emb) != settings.embedding_dims:
-                raise ValueError(f"Embedding dims mismatch: got {len(emb)}, expected {settings.embedding_dims}")
-
-            rows.append(
-                {
-                    "doc_id": doc_id,
-                    "page_number": page_number,
-                    "chunk_index": ci,
-                    "content": chunk,
-                    "embedding": embedding_to_pgvector_str(emb),
-                    "is_toc": toc_flag,
-                }
-            )
-            total_chunks += 1
-            if total_chunks % 60 == 0:
-                time.sleep(0.25)
-
-        sb.table("rag_chunks").insert(rows).execute()
-
-    return doc_id, total_chunks
-
-
-# =========================
-# Retrieval
-# =========================
-
-def retrieve_contexts(
-    settings: Settings,
-    question: str,
-    doc_id_filter: Optional[int] = None,
-) -> Tuple[List[Dict[str, Any]], float]:
-    oai = get_openai_client(settings.openai_api_key)
-    sb = get_supabase_client(settings.supabase_url, settings.supabase_service_key)
-
-    q_emb = openai_embed(oai, settings.embedding_model, question)
-    if len(q_emb) != settings.embedding_dims:
-        raise ValueError(f"Query embedding dims mismatch: got {len(q_emb)}, expected {settings.embedding_dims}")
-
-    payload = {
-        "query_embedding": embedding_to_pgvector_str(q_emb),
-        "match_count": settings.top_k,
-        "doc_id_filter": doc_id_filter,
-    }
-
-    # ✅ DB 레벨에서 is_toc=false만 반환되도록 RPC가 필터링해야 합니다.
-    res = sb.rpc("match_rag_chunks_v3", payload).execute()
-    rows = res.data or []
-
-    contexts = []
-    top1_similarity = -1.0
-
-    for i, r in enumerate(rows):
-        sim = float(r.get("similarity", -1.0))
-        if i == 0:
-            top1_similarity = sim
-
-        contexts.append(
-            {
-                "id": r["id"],
-                "doc_id": r["doc_id"],
-                "page_number": r["page_number"],
-                "chunk_index": r["chunk_index"],
-                "content": r["content"],
-                "similarity": sim,
-            }
-        )
-
-    return contexts, top1_similarity
-
-
-def get_page_image_url(settings: Settings, doc_id: int, page_number: int) -> Optional[str]:
-    sb = get_supabase_client(settings.supabase_url, settings.supabase_service_key)
-
-    res = (
-        sb.table("manual_pages")
-        .select("image_url,is_toc")
-        .eq("doc_id", doc_id)
-        .eq("page_number", page_number)
-        .limit(1)
-        .execute()
-    )
-    if res.data:
-        if bool(res.data[0].get("is_toc")) is True:
-            return None
-        return res.data[0].get("image_url")
-    return None
-
-
-def list_docs(settings: Settings) -> List[Dict[str, Any]]:
-    sb = get_supabase_client(settings.supabase_url, settings.supabase_service_key)
-    res = sb.table("manual_docs").select("id,title,created_at").order("created_at", desc=True).execute()
-    return res.data or []
-
-
-# =========================
-# Streamlit UI
-# =========================
 
 st.set_page_config(page_title="PDF 매뉴얼 RAG 챗봇", layout="wide")
 settings = load_settings()
@@ -513,7 +37,6 @@ settings.similarity_threshold = st.sidebar.slider(
     help="top1 similarity가 이 값보다 작으면 '문서에 존재하지 않습니다.'",
 )
 
-
 # -------------------------
 # Admin
 # -------------------------
@@ -539,7 +62,6 @@ if mode == "관리자: PDF 업로드/적재":
         for d in docs:
             st.write(f"- #{d['id']} | {d['title']} | {d['created_at']}")
 
-    # ✅ 문서 삭제 UI
     st.divider()
     st.subheader("문서 삭제 (DB + Storage 이미지)")
 
@@ -585,16 +107,73 @@ else:
     )
     doc_id_filter = selected["id"]
 
+    # 채팅 히스토리
     if "chat" not in st.session_state:
         st.session_state.chat = []
-
     for msg in st.session_state.chat:
         with st.chat_message(msg["role"]):
             st.markdown(msg["content"])
 
-    question = st.chat_input("장비 사용/에러/설치 방법을 질문하세요...")
+    # ✅ OCR / draft 상태
+    if "draft_question" not in st.session_state:
+        st.session_state.draft_question = ""
+    if "ocr_image_signature" not in st.session_state:
+        st.session_state.ocr_image_signature = None  # 마지막 OCR 수행한 이미지 식별자
+    if "ocr_text" not in st.session_state:
+        st.session_state.ocr_text = ""
 
-    if question:
+    # -------------------------
+    # 이미지 업로드 → 자동 OCR (새 이미지일 때만 1회)
+    # -------------------------
+    st.markdown("### 📷 이미지 업로드 (업로드 시 자동 OCR, 질문 전송과 무관)")
+    img_file = st.file_uploader(
+        "장비 화면 이미지를 업로드하세요 (png/jpg/jpeg)",
+        type=["png", "jpg", "jpeg"],
+        accept_multiple_files=False,
+    )
+
+    if img_file:
+        img_bytes = img_file.getvalue()
+        mime = img_file.type or "image/png"
+
+        # 미리보기
+        st.image(img_bytes, caption="업로드한 이미지", width=350)
+
+        # ✅ 내용 기반 시그니처(해시): rerun(질문 전송)에도 동일 이미지면 OCR 재실행 안 함
+        digest = hashlib.sha256(img_bytes).hexdigest()
+        image_signature = f"{digest}"
+
+        # ✅ 새 이미지일 때만 OCR 실행
+        if st.session_state.ocr_image_signature != image_signature:
+            with st.spinner("이미지에서 문자 추출 중 (gpt-4.1-mini)..."):
+                oai = get_openai_client(settings.openai_api_key)
+                ocr_text = extract_text_from_image_gpt41mini(oai, img_bytes, mime)
+
+            st.session_state.ocr_image_signature = image_signature
+            st.session_state.ocr_text = (ocr_text or "").strip()
+
+            if st.session_state.ocr_text:
+                # ✅ OCR 결과를 질문창으로 보내기(자동 질문 전송 X)
+                st.session_state.draft_question = st.session_state.ocr_text
+                st.success("OCR 완료: 질문 입력창에 반영되었습니다. 필요하면 수정 후 전송하세요.")
+            else:
+                st.warning("OCR 결과가 비어있습니다. 이미지 해상도/선명도를 확인해 주세요.")
+
+    # -------------------------
+    # 질문 입력 / 전송 (OCR과 무관: 질문창 내용만 전송)
+    # -------------------------
+    question = st.text_area(
+        "질문 입력 (OCR 결과가 있으면 자동으로 표시됩니다. 수정 후 전송하세요.)",
+        value=st.session_state.draft_question,
+        height=120,
+    )
+
+    send = st.button("질문 전송", type="primary", disabled=not question.strip())
+
+    if send:
+        # 전송은 질문창 내용만 사용 (OCR 재실행과 무관)
+        st.session_state.draft_question = ""
+
         st.session_state.chat.append({"role": "user", "content": question})
         with st.chat_message("user"):
             st.markdown(question)
@@ -605,8 +184,7 @@ else:
                 st.caption(f"top1 similarity = {top1_similarity:.3f} (threshold={settings.similarity_threshold:.2f})")
 
                 out_of_scope = (not contexts) or (top1_similarity < settings.similarity_threshold)
-
-                cited_pages: List[int] = []
+                cited_pages = []
 
                 if out_of_scope:
                     answer = "문서에 존재하지 않습니다."
@@ -616,12 +194,14 @@ else:
                     answer = out["answer"]
                     cited_pages = out.get("cited_pages", [])
 
+                    # 보수적으로 한 번 더 차단 (애매한 경우)
                     if ("문서에 존재하지 않습니다" not in answer) and (top1_similarity < (settings.similarity_threshold + 0.02)):
                         answer = "문서에 존재하지 않습니다."
                         cited_pages = []
 
                 st.markdown(answer)
 
+                # 관련 페이지: 거절답변이면 절대 표시하지 않음
                 if is_refusal_answer(answer):
                     related_pages = []
                     resolved_doc_id = None
@@ -631,17 +211,15 @@ else:
                         contexts=contexts,
                         max_pages=settings.max_related_pages,
                     )
+                    resolved_doc_id = (
+                        doc_id_filter if doc_id_filter is not None
+                        else (int(contexts[0]["doc_id"]) if contexts else None)
+                    )
 
-                    if doc_id_filter is not None:
-                        resolved_doc_id = doc_id_filter
-                    else:
-                        resolved_doc_id = int(contexts[0]["doc_id"]) if contexts else None
-
-                # ✅ 관련 페이지 최대 5장 (3 + 2 레이아웃)
+                # 관련 페이지 3+3 (최대 6)
                 if resolved_doc_id and related_pages:
-                    st.caption("관련 페이지 (최대 5페이지, 페이지 순)")
+                    st.caption("관련 페이지 (최대 6페이지, 페이지 순)")
 
-                    # 1줄: 최대 3개
                     row1 = related_pages[:3]
                     cols1 = st.columns(3)
                     for idx in range(3):
@@ -654,10 +232,9 @@ else:
                                 else:
                                     st.write(f"p.{p} 이미지 없음")
 
-                    # 2줄: 나머지(최대 2개)
-                    row2 = related_pages[3:5]
+                    row2 = related_pages[3:6]
                     if row2:
-                        cols2 = st.columns(3)  # 가운데 정렬 느낌(2개만 쓰고 1개는 비움)
+                        cols2 = st.columns(3)
                         for idx in range(3):
                             with cols2[idx]:
                                 if idx < len(row2):
