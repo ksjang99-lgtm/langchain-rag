@@ -210,6 +210,9 @@ else:
                         cited_pages=cited_pages,
                         contexts=contexts,
                         max_pages=settings.max_related_pages,
+                        top1_similarity=top1_similarity,
+                        min_abs=0.35,
+                        max_drop=0.08,
                     )
                     resolved_doc_id = (
                         doc_id_filter if doc_id_filter is not None
