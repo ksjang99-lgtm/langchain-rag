@@ -9,7 +9,8 @@ from retrieval_service import retrieve_contexts, list_docs, get_page_image_url
 from answer_service import openai_answer_with_rag
 from storage_service import delete_doc_and_assets
 from utils_text import is_refusal_answer, merge_pages_cited_then_search
-
+from PIL import Image
+from io import BytesIO  # ✅ 추가
 
 st.set_page_config(page_title="PDF 매뉴얼 RAG 챗봇", layout="wide")
 settings = load_settings()
@@ -132,12 +133,33 @@ else:
         accept_multiple_files=False,
     )
 
-    if img_file:
+    if img_file:        
         img_bytes = img_file.getvalue()
         mime = img_file.type or "image/png"
 
         # 미리보기
         st.image(img_bytes, caption="업로드한 이미지", width=350)
+
+        # ✅ 최대 1024px로 자동 축소 (비율 유지)
+        try:
+            pil_img = Image.open(BytesIO(img_bytes))
+            pil_img.thumbnail((1024, 1024), Image.LANCZOS)
+
+            buf = BytesIO()
+            # 원본 포맷을 최대한 유지 (없으면 PNG)
+            save_format = (pil_img.format or "PNG").upper()
+            if save_format not in ("PNG", "JPEG", "JPG", "WEBP"):
+                save_format = "PNG"
+
+            # JPEG로 저장할 때는 RGB 필요할 수 있음
+            if save_format in ("JPEG", "JPG") and pil_img.mode in ("RGBA", "P"):
+                pil_img = pil_img.convert("RGB")
+
+            pil_img.save(buf, format=save_format)
+            img_bytes = buf.getvalue()  # ✅ 이후 로직(OCR/미리보기/해시)에 축소본을 사용
+        except Exception:
+            # 축소 실패 시 원본 유지
+            pass
 
         # ✅ 내용 기반 시그니처(해시): rerun(질문 전송)에도 동일 이미지면 OCR 재실행 안 함
         digest = hashlib.sha256(img_bytes).hexdigest()
