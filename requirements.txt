@@ -9,3 +9,7 @@ tiktoken>=0.7.0
 # Adobe PDF Services SDK
 pdfservices-sdk>=3.0.0
 supabase>=2.6.0
+
+# 오디오 녹음 컴포넌트
+audio_recorder_streamlit
+pydub
