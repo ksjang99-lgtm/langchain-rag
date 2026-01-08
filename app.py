@@ -133,7 +133,7 @@ else:
     if "ocr_image_signature" not in st.session_state:
         st.session_state.ocr_image_signature = None  # 마지막 OCR 수행한 이미지 식별자
     if "ocr_text" not in st.session_state:
-        st.session_state.ocr_text = None
+        st.session_state.ocr_text = ""
     if "last_audio_bytes" not in st.session_state:
         st.session_state.last_audio_bytes = None
     if "transcription_result" not in st.session_state:
@@ -273,28 +273,32 @@ else:
         })
         st.session_state.draft_question = final_prompt
         st.session_state.transcription_result = None
-        st.session_state.ocr_text = None
         st.rerun()
     
     if img_file: 
         print("이미지")   
         img_bytes = img_file.getvalue()
         mime = img_file.type or "image/png"
+        if len(st.session_state.ocr_text) > 0:
+            question = st.text_input(
+                "OCR 질문",
+                value=st.session_state.ocr_text
+            )
 
         # 미리보기
-        col1, col2 = st.columns([1, 7], gap="medium")
-        with col1:
-            st.image(img_bytes, caption="업로드한 이미지")
-        with col2:
-            if st.session_state.ocr_text and len(st.session_state.ocr_text) > 0:
-                question = st.text_input(
-                    "OCR 질문",
-                    value=st.session_state.ocr_text
-                )
-                if st.button("이 질문으로 전송"):
-                    print("전송")
-            else:
-                pass
+        # col1, col2 = st.columns([1, 7], gap="medium")
+        # with col1:
+        #     st.image(img_bytes, caption="업로드한 이미지")
+        # with col2:
+        #     if len(st.session_state.ocr_text) > 0:
+        #         question = st.text_input(
+        #             "OCR 질문",
+        #             value=st.session_state.ocr_text
+        #         )
+        #         # if st.button("이 질문으로 전송"):
+        #         #     print("전송")
+        #     else:
+        #         pass
                 
 
         # ✅ 최대 1024px로 자동 축소 (비율 유지)
