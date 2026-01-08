@@ -16,6 +16,7 @@ from audio_recorder_streamlit import audio_recorder
 import os
 import tempfile
 from process_rag_query import process_rag_query
+from render import render_related_pages, get_related_pages
 
 st.set_page_config(page_title="PDF 매뉴얼 RAG 챗봇", layout="wide")
 settings = load_settings()
@@ -113,12 +114,7 @@ else:
     )
     doc_id_filter = selected["id"]
 
-    # 채팅 히스토리
-    if "chat" not in st.session_state:
-        st.session_state.chat = []
-    for msg in st.session_state.chat:
-        with st.chat_message(msg["role"]):
-            st.markdown(msg["content"])
+   
 
     # ✅ OCR / draft 상태
     if "draft_question" not in st.session_state:
@@ -131,7 +127,123 @@ else:
         st.session_state.last_audio_bytes = None
     if "transcription_result" not in st.session_state:
         st.session_state.transcription_result = None
+    if "finish_voice" not in st.session_state:
+        st.session_state.finish_voice = False
 
+     # 채팅 히스토리
+    if "chat" not in st.session_state:
+        st.session_state.chat = []
+    for msg in st.session_state.chat:
+        with st.chat_message(msg["role"]):
+            st.markdown(msg["content"])
+            if msg["role"] == "assistant" and msg.get("pages"):
+                render_related_pages(msg.get("pages"))
+
+
+
+    # -------------------------
+    # 질문 입력 / 전송 (OCR과 무관: 질문창 내용만 전송)
+    # -------------------------
+    prompt = st.chat_input(
+        "질문 입력 (OCR 결과가 있으면 자동으로 표시됩니다. 수정 후 전송하세요.)"
+    )
+
+    col1, col2, space = st.columns([2, 0.8, 5])
+    with col1:
+        audio_bytes = audio_recorder(
+            text="",
+            recording_color="#e74c3c",
+            neutral_color="#3498db",
+            icon_name="microphone",
+            icon_size="3x",
+            pause_threshold=2.0,
+            key="audio_recorder"
+        )
+
+    with col2:
+       pass
+
+    with space:
+        # 아무것도 작성하지 않으면 빈 공간으로 남습니다.
+        pass
+
+    print("0 start")
+    if audio_bytes and audio_bytes != st.session_state.last_audio_bytes:
+         print("1 녹음 완료")
+    elif st.session_state.last_audio_bytes:
+        print("1 녹음 완료")
+
+    # 변환 처리
+    if audio_bytes and audio_bytes != st.session_state.last_audio_bytes:
+        st.session_state.last_audio_bytes = audio_bytes
+        st.session_state.transcription_result = None  # 이전 결과 초기화
+        print("1 녹음 저장")
+        # 임시 파일로 저장
+        with tempfile.NamedTemporaryFile(delete=False, suffix=".wav") as tmp_file:
+            tmp_file.write(st.session_state.last_audio_bytes)
+            wav_path = tmp_file.name
+        try:
+            # Whisper API 호출
+            with st.spinner("🤖 음성을 텍스트로 변환 중..."):
+                with open(wav_path, "rb") as audio_file:
+                    client = get_openai_client(settings.openai_api_key)
+                    transcript = client.audio.transcriptions.create(
+                        model="whisper-1",
+                        file=audio_file,
+                        language="ko",
+                        response_format="text"
+                    )
+        
+            # 결과 저장
+            st.session_state.transcription_result = transcript
+            print(f"음성변환: {transcript}")
+        
+        except Exception as e:
+            st.error(f"❌ 변환 실패: {str(e)}")
+            st.exception(e)
+        
+        finally:
+            # 임시 파일 삭제
+            try:
+                if os.path.exists(wav_path):
+                    os.remove(wav_path)
+            except Exception:
+                pass
+    
+    # 5. 실제 질문 결정
+    final_prompt = prompt or st.session_state.transcription_result
+    if final_prompt:
+        st.session_state.draft_question = ""
+
+        st.session_state.chat.append({"role": "user", "content": final_prompt})
+        with st.chat_message("user"):
+            st.markdown(final_prompt)
+
+        with st.chat_message("assistant"):
+            with st.spinner("검색 및 답변 생성 중..."):
+                result = process_rag_query(settings, final_prompt, doc_id_filter)
+                answer = result["answer"]
+                related_pages = result["related_pages"]
+                resolved_doc_id = result["resolved_doc_id"]
+                top1_similarity = result["top1_similarity"]
+                # # 유사도 정보 표시
+                # st.caption(f"top1 similarity = {top1_similarity:.3f} (threshold={settings.similarity_threshold:.2f})")
+                
+                # 답변 출력
+                # st.markdown(answer)
+            pages = get_related_pages(
+                settings=settings,
+                resolved_doc_id=resolved_doc_id,
+                related_pages=related_pages
+            )
+            # render_related_pages(pages)
+        st.session_state.chat.append({
+            "role": "assistant",
+            "content": answer,
+            "pages": pages
+        })
+        st.session_state.transcription_result = None
+        st.rerun()
 
     # -------------------------
     # 이미지 업로드 → 자동 OCR (새 이미지일 때만 1회)
@@ -191,197 +303,3 @@ else:
             else:
                 st.warning("OCR 결과가 비어있습니다. 이미지 해상도/선명도를 확인해 주세요.")
 
-    # -------------------------
-    # 질문 입력 / 전송 (OCR과 무관: 질문창 내용만 전송)
-    # -------------------------
-    question = st.text_area(
-        "질문 입력 (OCR 결과가 있으면 자동으로 표시됩니다. 수정 후 전송하세요.)",
-        value=st.session_state.draft_question,
-        height=120,
-    )
-
-    col1, col2, space = st.columns([2, 0.8, 5])
-    with col1:
-        send = st.button(
-            "질문 전송", 
-            type="primary", 
-            disabled=not question.strip() if question else True,
-            use_container_width=True
-        )
-
-    with col2:
-       audio_bytes = audio_recorder(
-            text="",
-            recording_color="#e74c3c",
-            neutral_color="#3498db",
-            icon_name="microphone",
-            icon_size="3x",
-            pause_threshold=2.0,
-            key="audio_recorder"
-        )
-
-    with space:
-        # 아무것도 작성하지 않으면 빈 공간으로 남습니다.
-        pass
-
-    if send:
-        # 전송은 질문창 내용만 사용 (OCR 재실행과 무관)
-        st.session_state.draft_question = ""
-
-        st.session_state.chat.append({"role": "user", "content": question})
-        with st.chat_message("user"):
-            st.markdown(question)
-
-        with st.chat_message("assistant"):
-            with st.spinner("검색 및 답변 생성 중..."):
-                contexts, top1_similarity = retrieve_contexts(settings, question, doc_id_filter=doc_id_filter)
-                st.caption(f"top1 similarity = {top1_similarity:.3f} (threshold={settings.similarity_threshold:.2f})")
-
-                out_of_scope = (not contexts) or (top1_similarity < settings.similarity_threshold)
-                cited_pages = []
-
-                if out_of_scope:
-                    answer = "문서에 존재하지 않습니다."
-                else:
-                    oai = get_openai_client(settings.openai_api_key)
-                    out = openai_answer_with_rag(oai, settings.chat_model, question, contexts)
-                    answer = out["answer"]
-                    cited_pages = out.get("cited_pages", [])
-
-                    # 보수적으로 한 번 더 차단 (애매한 경우)
-                    if ("문서에 존재하지 않습니다" not in answer) and (top1_similarity < (settings.similarity_threshold + 0.02)):
-                        answer = "문서에 존재하지 않습니다."
-                        cited_pages = []
-
-                st.markdown(answer)
-
-                # 관련 페이지: 거절답변이면 절대 표시하지 않음
-                if is_refusal_answer(answer):
-                    related_pages = []
-                    resolved_doc_id = None
-                else:
-                    related_pages = merge_pages_cited_then_search(
-                        cited_pages=cited_pages,
-                        contexts=contexts,
-                        max_pages=settings.max_related_pages,
-                        top1_similarity=top1_similarity,
-                        min_abs=0.35,
-                        max_drop=0.08,
-                    )
-                    resolved_doc_id = (
-                        doc_id_filter if doc_id_filter is not None
-                        else (int(contexts[0]["doc_id"]) if contexts else None)
-                    )
-
-                # 관련 페이지 3+3 (최대 6)
-                if resolved_doc_id and related_pages:
-                    st.caption("관련 페이지 (최대 6페이지, 페이지 순)")
-
-                    row1 = related_pages[:3]
-                    cols1 = st.columns(3)
-                    for idx in range(3):
-                        with cols1[idx]:
-                            if idx < len(row1):
-                                p = row1[idx]
-                                url = get_page_image_url(settings, resolved_doc_id, int(p))
-                                if url:
-                                    st.image(url, caption=f"p.{p}", width="stretch")
-                                else:
-                                    st.write(f"p.{p} 이미지 없음")
-
-                    row2 = related_pages[3:6]
-                    if row2:
-                        cols2 = st.columns(3)
-                        for idx in range(3):
-                            with cols2[idx]:
-                                if idx < len(row2):
-                                    p = row2[idx]
-                                    url = get_page_image_url(settings, resolved_doc_id, int(p))
-                                    if url:
-                                        st.image(url, caption=f"p.{p}", width="stretch")
-                                    else:
-                                        st.write(f"p.{p} 이미지 없음")
-
-        st.session_state.chat.append({"role": "assistant", "content": answer})
-
-    
-    if audio_bytes and audio_bytes != st.session_state.last_audio_bytes:
-        st.session_state.last_audio_bytes = audio_bytes
-        st.session_state.transcription_result = None  # 이전 결과 초기화
-        print("1 녹음 완료")
-    elif st.session_state.last_audio_bytes:
-        print("2 녹음 완료")
-
-    # 변환 처리
-    if st.session_state.last_audio_bytes and not st.session_state.transcription_result:
-        # 임시 파일로 저장
-        with tempfile.NamedTemporaryFile(delete=False, suffix=".wav") as tmp_file:
-            tmp_file.write(st.session_state.last_audio_bytes)
-            wav_path = tmp_file.name
-        try:
-            # Whisper API 호출
-            with st.spinner("🤖 음성을 텍스트로 변환 중..."):
-                with open(wav_path, "rb") as audio_file:
-                    client = get_openai_client(settings.openai_api_key)
-                    transcript = client.audio.transcriptions.create(
-                        model="whisper-1",
-                        file=audio_file,
-                        language="ko",
-                        response_format="text"
-                    )
-        
-            # 결과 저장
-            st.session_state.transcription_result = transcript
-            print(f"음성변환: {transcript}")
-
-            st.session_state.draft_question = ""
-            st.session_state.chat.append({"role": "user", "content": transcript})
-    
-            with st.chat_message("user"):
-                st.markdown(transcript)
-
-            with st.chat_message("assistant"):
-                with st.spinner("검색 및 답변 생성 중..."):
-                    # 위에서 만든 함수 호출
-                    result = process_rag_query(settings, transcript, doc_id_filter)
-                    
-                    answer = result["answer"]
-                    related_pages = result["related_pages"]
-                    resolved_doc_id = result["resolved_doc_id"]
-                    top1_similarity = result["top1_similarity"]
-
-                    # 유사도 정보 표시
-                    st.caption(f"top1 similarity = {top1_similarity:.3f} (threshold={settings.similarity_threshold:.2f})")
-                    
-                    # 답변 출력
-                    st.markdown(answer)
-
-                # 관련 페이지 이미지 출력 (UI 로직)
-                if resolved_doc_id and related_pages:
-                    st.caption("관련 페이지 (최대 6페이지, 페이지 순)")
-            
-                    # 페이지를 3개씩 끊어서 처리
-                    for i in range(0, len(related_pages), 3):
-                        row_pages = related_pages[i : i + 3]
-                        cols = st.columns(3)
-                        for idx, p in enumerate(row_pages):
-                            with cols[idx]:
-                                url = get_page_image_url(settings, resolved_doc_id, int(p))
-                                if url:
-                                    st.image(url, caption=f"p.{p}", use_container_width=True) # width="stretch" 대신 최신 문법 사용
-                                else:
-                                    st.write(f"p.{p} 이미지 없음")
-
-            st.session_state.chat.append({"role": "assistant", "content": answer})
-        
-        except Exception as e:
-            st.error(f"❌ 변환 실패: {str(e)}")
-            st.exception(e)
-        
-        finally:
-            # 임시 파일 삭제
-            try:
-                if os.path.exists(wav_path):
-                    os.remove(wav_path)
-            except Exception:
-                pass
