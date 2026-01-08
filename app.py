@@ -21,7 +21,7 @@ from render import render_related_pages, get_related_pages
 st.set_page_config(page_title="PDF 매뉴얼 RAG 챗봇", layout="wide")
 settings = load_settings()
 
-st.title("📘 PDF 매뉴얼 RAG 챗봇 (Supabase + OpenAI)")
+st.title("🛡️ 이기종 보안 장비 통합 운영 지원 AI 플랫폼 🖥️")
 
 if not settings.openai_api_key or not settings.supabase_url or not settings.supabase_service_key:
     st.warning(
@@ -32,17 +32,28 @@ if not settings.openai_api_key or not settings.supabase_url or not settings.supa
     )
     st.stop()
 
-mode = st.sidebar.radio("메뉴", ["관리자: PDF 업로드/적재", "사용자: 챗봇"])
+mode = st.sidebar.radio("메뉴", ["사용자: 챗봇", "관리자: PDF 업로드/적재"])
 
 st.sidebar.markdown("---")
 settings.similarity_threshold = st.sidebar.slider(
-    "Out-of-scope 유사도 임계치(높을수록 엄격)",
+    "Out-of-scope 유사도 임계치",
     min_value=0.00,
     max_value=1.00,
     value=float(settings.similarity_threshold),
     step=0.01,
     help="top1 similarity가 이 값보다 작으면 '문서에 존재하지 않습니다.'",
 )
+
+# [추가] 이미지 축소 최대 px 슬라이더 (OCR/해시/미리보기 공통 적용)
+resize_max_px = st.sidebar.slider(
+    "이미지 축소 최대 px",
+    min_value=512,
+    max_value=2048,
+    value=1024,
+    step=64,
+    help="업로드 이미지의 긴 변을 이 값 이하로 축소합니다. (OCR 비용/속도 최적화)",
+)
+
 
 # -------------------------
 # Admin
@@ -265,7 +276,7 @@ else:
         # ✅ 최대 1024px로 자동 축소 (비율 유지)
         try:
             pil_img = Image.open(BytesIO(img_bytes))
-            pil_img.thumbnail((1024, 1024), Image.LANCZOS)
+            pil_img.thumbnail((resize_max_px, resize_max_px), Image.LANCZOS)
 
             buf = BytesIO()
             # 원본 포맷을 최대한 유지 (없으면 PNG)
