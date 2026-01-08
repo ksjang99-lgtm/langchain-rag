@@ -129,11 +129,11 @@ else:
 
     # ✅ OCR / draft 상태
     if "draft_question" not in st.session_state:
-        st.session_state.draft_question = ""
+        st.session_state.draft_question = "질문 입력 (OCR 결과가 있으면 자동으로 표시됩니다. 수정 후 전송하세요.)"
     if "ocr_image_signature" not in st.session_state:
         st.session_state.ocr_image_signature = None  # 마지막 OCR 수행한 이미지 식별자
     if "ocr_text" not in st.session_state:
-        st.session_state.ocr_text = ""
+        st.session_state.ocr_text = None
     if "last_audio_bytes" not in st.session_state:
         st.session_state.last_audio_bytes = None
     if "transcription_result" not in st.session_state:
@@ -155,11 +155,12 @@ else:
     # -------------------------
     # 질문 입력 / 전송 (OCR과 무관: 질문창 내용만 전송)
     # -------------------------
+    print(f"st.session_state.draft_question:{st.session_state.draft_question}")
     prompt = st.chat_input(
-        "질문 입력 (OCR 결과가 있으면 자동으로 표시됩니다. 수정 후 전송하세요.)"
+       st.session_state.draft_question
     )
 
-    col1, col2, space = st.columns([2, 0.8, 5])
+    col1, col2, space = st.columns([0.4, 7, 2.6], gap="medium")
     with col1:
         audio_bytes = audio_recorder(
             text="",
@@ -172,17 +173,33 @@ else:
         )
 
     with col2:
-       pass
-
+        img_file = st.file_uploader(
+                "📷 장비 화면 이미지를 업로드 (업로드 시 자동 OCR, 질문 전송과 무관)",
+                type=["png", "jpg", "jpeg"],
+                accept_multiple_files=False,
+            )
+        # col3, col4, col5 = st.columns([6, 3, 2])
+        # # -------------------------
+        # # 이미지 업로드 → 자동 OCR (새 이미지일 때만 1회)
+        # # -------------------------
+        # with col3:
+        #     st.markdown("### 📷 이미지 업로드 (업로드 시 자동 OCR, 질문 전송과 무관)")
+        # with col4:
+        #     img_file = st.file_uploader(
+        #         "📷 장비 화면 이미지를 업로드 (업로드 시 자동 OCR, 질문 전송과 무관)",
+        #         type=["png", "jpg", "jpeg"],
+        #         accept_multiple_files=False,
+        #     )
+        # with col5:
+        #     pass
     with space:
-        # 아무것도 작성하지 않으면 빈 공간으로 남습니다.
+            # 아무것도 작성하지 않으면 빈 공간으로 남습니다.
         pass
-
-    print("0 start")
-    if audio_bytes and audio_bytes != st.session_state.last_audio_bytes:
-         print("1 녹음 완료")
-    elif st.session_state.last_audio_bytes:
-        print("1 녹음 완료")
+    # print("0 start")
+    # if audio_bytes and audio_bytes != st.session_state.last_audio_bytes:
+    #      print("1 녹음 완료")
+    # elif st.session_state.last_audio_bytes:
+    #     print("1 녹음 완료")
 
     # 변환 처리
     if audio_bytes and audio_bytes != st.session_state.last_audio_bytes:
@@ -222,8 +239,9 @@ else:
                 pass
     
     # 5. 실제 질문 결정
-    final_prompt = prompt or st.session_state.transcription_result
+    final_prompt = prompt or st.session_state.transcription_result 
     if final_prompt:
+        print("질문")   
         st.session_state.draft_question = ""
 
         st.session_state.chat.append({"role": "user", "content": final_prompt})
@@ -253,25 +271,31 @@ else:
             "content": answer,
             "pages": pages
         })
+        st.session_state.draft_question = final_prompt
         st.session_state.transcription_result = None
+        st.session_state.ocr_text = None
         st.rerun()
-
-    # -------------------------
-    # 이미지 업로드 → 자동 OCR (새 이미지일 때만 1회)
-    # -------------------------
-    st.markdown("### 📷 이미지 업로드 (업로드 시 자동 OCR, 질문 전송과 무관)")
-    img_file = st.file_uploader(
-        "장비 화면 이미지를 업로드하세요 (png/jpg/jpeg)",
-        type=["png", "jpg", "jpeg"],
-        accept_multiple_files=False,
-    )
-
-    if img_file:        
+    
+    if img_file: 
+        print("이미지")   
         img_bytes = img_file.getvalue()
         mime = img_file.type or "image/png"
 
         # 미리보기
-        st.image(img_bytes, caption="업로드한 이미지", width=350)
+        col1, col2 = st.columns([1, 7], gap="medium")
+        with col1:
+            st.image(img_bytes, caption="업로드한 이미지")
+        with col2:
+            if st.session_state.ocr_text and len(st.session_state.ocr_text) > 0:
+                question = st.text_input(
+                    "OCR 질문",
+                    value=st.session_state.ocr_text
+                )
+                if st.button("이 질문으로 전송"):
+                    print("전송")
+            else:
+                pass
+                
 
         # ✅ 최대 1024px로 자동 축소 (비율 유지)
         try:
@@ -311,6 +335,7 @@ else:
                 # ✅ OCR 결과를 질문창으로 보내기(자동 질문 전송 X)
                 st.session_state.draft_question = st.session_state.ocr_text
                 st.success("OCR 완료: 질문 입력창에 반영되었습니다. 필요하면 수정 후 전송하세요.")
+                st.rerun()
             else:
                 st.warning("OCR 결과가 비어있습니다. 이미지 해상도/선명도를 확인해 주세요.")
 
