@@ -160,7 +160,7 @@ else:
        st.session_state.draft_question
     )
 
-    col1, col2, space = st.columns([0.4, 7, 2.6], gap="medium")
+    col1, col2, space = st.columns([0.07, 0.33, 0.6], vertical_alignment ="bottom")
     with col1:
         audio_bytes = audio_recorder(
             text="",
