@@ -5,21 +5,22 @@ def render_related_pages(pages):
     if len(pages) < 1:
         return
     
-    st.caption("관련 페이지 (최대 6페이지, 페이지 순)")
-    # 3개씩 끊어서 행 구성
-    for row_start in range(0, len(pages), 3):
-        row_pages = pages[row_start:row_start + 3]
-        cols = st.columns(3)
+    # st.caption("관련 페이지 (최대 6페이지, 페이지 순)")
+    with st.expander("관련 페이지가 있습니다.", icon="➕"):
+        # 3개씩 끊어서 행 구성
+        for row_start in range(0, len(pages), 3):
+            row_pages = pages[row_start:row_start + 3]
+            cols = st.columns(3)
 
-        for idx, item in enumerate(row_pages):
-            with cols[idx]:
-                p = item["page"]
-                url = item["url"]
+            for idx, item in enumerate(row_pages):
+                with cols[idx]:
+                    p = item["page"]
+                    url = item["url"]
 
-                if url == "":
-                    st.write(f"p.{p} 이미지 없음")
-                else:
-                    st.image(url, caption=f"p.{p}", width="stretch")
+                    if url == "":
+                        st.write(f"p.{p} 이미지 없음")
+                    else:
+                        st.image(url, caption=f"p.{p}", width="stretch")
 
 
 def get_related_pages(settings, resolved_doc_id, related_pages, max_pages=6):
