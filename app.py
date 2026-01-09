@@ -21,7 +21,7 @@ from render import render_related_pages, get_related_pages
 st.set_page_config(page_title="NexOps-가장 명확한 근거, 가장 빠른 현장 조치", layout="wide")
 settings = load_settings()
 
-st.title("🛡️ NexOps")
+st.title("🛡️ NexOps for Security")
 
 if not settings.openai_api_key or not settings.supabase_url or not settings.supabase_service_key:
     st.warning(
